@@ -1,10 +1,28 @@
 // ======================================================
 // XIAO ML KIT (OR XIAO ESP32S3 SENSE)
-// ON-DEVICE VISION ANOMALY DETECTION — v001
+// ON-DEVICE VISION ANOMALY DETECTION — v002
 //
-// Based on on-device-vision-classification v44
-// Anomaly strategy: CNN front-end (unchanged) + Global Average Pooling +
+// Based on on-device-vision-anomaly v001 (itself based on on-device-vision-classification v44)
+// Anomaly strategy: CNN front-end + Global Average Pooling +
 //   multiple normal prototypes + normalized distance scoring + temporal smoothing
+//
+// v002 = v001 + the additions that make it a matched pair with index-v002.html
+//   (the lean SD-card web trainer). Every change is marked  // v002:
+//   - layout is fully derived from #defines (fixed the hidden "f*36" / "4" in conv2)
+//   - refuses a myWeights.bin / myPrototypes.bin of the wrong size
+//   - reads class names from /header/config.json (tiny parser, no library)
+//   - camera parity defines (mirror, flip, brightness, AE, warm-up frames)
+//   - optional Web Serial debug frames ('@F' lines) only while the page is connected
+//
+// !! WARNING: v001 only mirrored the image (hmirror). v002 also flips it (vflip) and
+// !! changes brightness/AE. Images already on the SD card from v001 may now look
+// !! upside down compared with new ones: recapture them, or set CAM_VFLIP 0,
+// !! CAM_BRIGHTNESS 0 and CAM_AE_LEVEL 0 to get the v001 look back.
+// !! These camera values need bench tuning (not tested on hardware).
+//
+// LAYOUT (INPUT_SIZE, CONV1_FILTERS, CONV2_FILTERS, NUM_PROTOTYPES, NUM_CLASSES) is COMPILE-TIME.
+// It is deliberately NOT converted to runtime allocation (keeps the code small).
+// Change the #defines, re-upload, and use matching weights from the web page.
 //
 // Workflow:
 //   1. Collect "normal" images into the single "0Normal" class folder
@@ -12,7 +30,7 @@
 //   3. Infer → live normality score 0–100% with temporal smoothing
 //
 // SD card stores: images in /images/0Normal/
-// SD card stores: weights (CNN) and prototypes in /header/
+// SD card stores: weights (CNN) and prototypes in /header/  (+ /header/config.json written by the web page)
 // Serial monitor and OLED output
 // By Jeremy Ellis
 // With free tier assistance from: Claude (code overview), ChatGPT (Critique),
@@ -60,8 +78,18 @@
 #include <math.h>
 #include <U8g2lib.h>
 #include <Wire.h>
+#include "mbedtls/base64.h"   // v002: base64 for the Web Serial debug frames
 
 U8G2_SSD1306_72X40_ER_1_HW_I2C u8g2(U8G2_R2, U8X8_PIN_NONE);
+
+// ======================================================
+// v002: CAMERA / DATA-SOURCE PARITY (images from the device should look like images from the page)
+// ======================================================
+#define CAM_HMIRROR          1   // v002: 1 = mirror left/right (v001 had this on)
+#define CAM_VFLIP            1   // v002: 1 = flip upside down (NEW in v002, bench-tune)
+#define CAM_BRIGHTNESS       1   // v002: -2..2 (NEW in v002, bench-tune)
+#define CAM_AE_LEVEL         1   // v002: auto-exposure level -2..2 (NEW in v002, bench-tune)
+#define CAM_WARMUP_FRAMES    3   // v002: frames discarded after camera init (auto exposure settles)
 
 // ======================================================
 // ANOMALY DETECTION CONFIGURATION
@@ -140,6 +168,7 @@ bool myWeightsTrained = false;
 
 // ======================================================
 // CNN ARCHITECTURE CONSTANTS (identical to classification v44)
+// The 3x3 kernel and 2x2 pool are fixed in the loops below; do not change the kernel defines.
 // ======================================================
 #define CONV1_KERNEL_SIZE 3
 #define CONV1_FILTERS     4
@@ -147,17 +176,30 @@ bool myWeightsTrained = false;
 
 #define CONV2_KERNEL_SIZE 3
 #define CONV2_FILTERS     8
-#define CONV2_WEIGHTS     (CONV2_KERNEL_SIZE * CONV2_KERNEL_SIZE * 4 * CONV2_FILTERS)
+#define CONV2_FAN_IN      (CONV2_KERNEL_SIZE * CONV2_KERNEL_SIZE * CONV1_FILTERS)  // v002: weights per conv2 filter (was a hidden 36)
+#define CONV2_WEIGHTS     (CONV2_FAN_IN * CONV2_FILTERS)                           // v002: was 3*3*4*8 with a hidden 4
 
 #define CONV1_OUTPUT_SIZE (INPUT_SIZE - 2)
 #define POOL1_OUTPUT_SIZE (CONV1_OUTPUT_SIZE / 2)
 #define CONV2_OUTPUT_SIZE (POOL1_OUTPUT_SIZE - 2)
 #define FLATTENED_SIZE    (CONV2_OUTPUT_SIZE * CONV2_OUTPUT_SIZE * CONV2_FILTERS)
 
+// v002: constraints checked at compile time
+static_assert(INPUT_SIZE % 2 == 0, "INPUT_SIZE must be even (2x2 pool)");
+static_assert(INPUT_SIZE >= 8 && INPUT_SIZE <= 240, "INPUT_SIZE must be 8..240");
+static_assert(CONV2_OUTPUT_SIZE >= 1, "conv2 output must be at least 1x1");
+static_assert(CONV1_FILTERS >= 1 && CONV2_FILTERS >= 1, "need at least one filter per conv layer");
+static_assert(NUM_PROTOTYPES >= 1, "need at least one prototype");
+
 // Anomaly head replaces the old dense output_w/output_b.
 // We keep one "class" for the CNN loss so that the CNN still trains with
 // a meaningful signal (autoencoder-style: label=0 always).
 #define OUTPUT_WEIGHTS (FLATTENED_SIZE * NUM_CLASSES)
+
+// v002: exact file sizes (float32 little-endian) the web page and the loaders must agree on
+#define WEIGHT_FLOATS (CONV1_WEIGHTS + CONV1_FILTERS + CONV2_WEIGHTS + CONV2_FILTERS + OUTPUT_WEIGHTS + NUM_CLASSES)
+#define WEIGHT_BYTES  (WEIGHT_FLOATS * 4)
+#define PROTO_BYTES   (2 * NUM_PROTOTYPES * GAP_SIZE * 4)
 
 // ======================================================
 // GLOBAL VARIABLE DEFINITIONS
@@ -231,6 +273,14 @@ inline float clip_value(float v, float mn=-100, float mx=100) {
 }
 inline float leaky_relu(float x)        { return x>0 ? x : 0.1f*x; }
 inline float leaky_relu_deriv(float x)  { return x>0 ? 1.0f : 0.1f; }
+
+// v002: one place that prints what THIS sketch was compiled for
+void myPrintLayout() {
+  Serial.printf("Sketch layout: input %dx%d, conv1 %d filters, conv2 %d filters, %d prototypes, %d class(es)\n",
+    INPUT_SIZE, INPUT_SIZE, CONV1_FILTERS, CONV2_FILTERS, NUM_PROTOTYPES, NUM_CLASSES);
+  Serial.printf("Sketch needs: myWeights.bin = %d floats = %d bytes, myPrototypes.bin = %d bytes\n",
+    (int)WEIGHT_FLOATS, (int)WEIGHT_BYTES, (int)PROTO_BYTES);
+}
 
 // ======================================================
 // UNIFIED TOUCH INPUT FUNCTIONS
@@ -366,7 +416,7 @@ void myAllocateMemory() {
   for(int i=0;i<CONV1_WEIGHTS;i++) myConv1_w[i]=((float)rand()/RAND_MAX-0.5f)*2.0f*c1std;
   for(int i=0;i<CONV1_FILTERS;i++) myConv1_b[i]=0;
 
-  float c2std = sqrt(2.0/36.0);
+  float c2std = sqrt(2.0/CONV2_FAN_IN);   // v002: was sqrt(2.0/36.0), only right for 4 conv1 filters
   for(int i=0;i<CONV2_WEIGHTS;i++) myConv2_w[i]=((float)rand()/RAND_MAX-0.5f)*2.0f*c2std;
   for(int i=0;i<CONV2_FILTERS;i++) myConv2_b[i]=0;
 
@@ -414,6 +464,14 @@ bool myLoadWeights() {
   Serial.println("Loading CNN weights from SD...");
   File f = SD.open("/header/myWeights.bin", FILE_READ);
   if (!f) return false;
+  // v002: refuse a weights file made for a different layout
+  if ((size_t)f.size() != (size_t)WEIGHT_BYTES) {
+    Serial.printf("ERROR: /header/myWeights.bin is %u bytes but this sketch needs %u bytes - NOT loaded\n",
+      (unsigned)f.size(), (unsigned)WEIGHT_BYTES);
+    myPrintLayout();
+    f.close();
+    return false;   // keeps random (or baked) weights
+  }
   f.read((uint8_t*)myConv1_w,  CONV1_WEIGHTS*4);
   f.read((uint8_t*)myConv1_b,  CONV1_FILTERS*4);
   f.read((uint8_t*)myConv2_w,  CONV2_WEIGHTS*4);
@@ -463,6 +521,14 @@ bool myLoadPrototypes() {
   if (!SD.exists("/header/myPrototypes.bin")) return false;
   File f = SD.open("/header/myPrototypes.bin", FILE_READ);
   if (!f) return false;
+  // v002: refuse a prototypes file made for a different layout
+  if ((size_t)f.size() != (size_t)PROTO_BYTES) {
+    Serial.printf("ERROR: /header/myPrototypes.bin is %u bytes but this sketch needs %u bytes - NOT loaded\n",
+      (unsigned)f.size(), (unsigned)PROTO_BYTES);
+    myPrintLayout();
+    f.close();
+    return false;
+  }
   f.read((uint8_t*)myPrototypeMean, NUM_PROTOTYPES*GAP_SIZE*sizeof(float));
   f.read((uint8_t*)myPrototypeStd,  NUM_PROTOTYPES*GAP_SIZE*sizeof(float));
   f.close();
@@ -501,6 +567,178 @@ bool myLoadImageFromFile(const char* path, float* buf) {
 }
 
 // ======================================================
+// v002: CONFIG.JSON  (/header/config.json written by index-v002.html)
+// Only the "classes" list is used (when its length equals NUM_CLASSES).
+// The other keys are only compared with the compiled values and a WARNING is printed.
+// Nothing about the layout is ever changed at runtime.
+// ======================================================
+// ==CFG PARSE START==
+static bool myCfgInt(const String& s, const char* key, int& out) {
+  String k = String("\"") + key + "\"";
+  int p = s.indexOf(k);
+  if (p < 0) return false;
+  p = s.indexOf(':', p + k.length());
+  if (p < 0) return false;
+  p++;
+  while (p < (int)s.length() && (s[p]==' ' || s[p]=='\n' || s[p]=='\r' || s[p]=='\t')) p++;
+  if (p >= (int)s.length() || !(isdigit((unsigned char)s[p]) || s[p]=='-')) return false;
+  out = s.substring(p).toInt();
+  return true;
+}
+
+// Reads the "classes" string list into names[] (max maxN). Returns how many strings were found, -1 if no list.
+static int myCfgClasses(const String& s, String* names, int maxN) {
+  int p = s.indexOf("\"classes\"");
+  if (p < 0) return -1;
+  p = s.indexOf('[', p);
+  if (p < 0) return -1;
+  p++;
+  int n = 0;
+  while (p < (int)s.length()) {
+    while (p < (int)s.length() && s[p] != '"' && s[p] != ']') p++;
+    if (p >= (int)s.length() || s[p] == ']') break;
+    p++;                                   // opening quote
+    String cur = "";
+    while (p < (int)s.length() && s[p] != '"') {
+      if (s[p] == '\\' && p + 1 < (int)s.length()) p++;   // keep the escaped character
+      cur += s[p]; p++;
+    }
+    p++;                                   // closing quote
+    if (n < maxN) names[n] = cur;
+    n++;
+  }
+  return n;
+}
+
+void myLoadConfig() {
+  if (!mySDavailable) return;
+  if (!SD.exists("/header/config.json")) { Serial.println("No /header/config.json - using compiled class labels"); return; }
+  File f = SD.open("/header/config.json", FILE_READ);
+  if (!f) return;
+  String txt = "";
+  while (f.available() && txt.length() < 4096) txt += (char)f.read();   // cap around 4 KB
+  f.close();
+
+  String names[NUM_CLASSES + 1];
+  int n = myCfgClasses(txt, names, NUM_CLASSES + 1);
+  if (n == NUM_CLASSES) {
+    bool ok = true;
+    for (int i = 0; i < NUM_CLASSES; i++)
+      if (names[i].length() == 0 || names[i].indexOf('/') >= 0 || names[i].indexOf('\\') >= 0 || names[i].indexOf("..") >= 0) ok = false;
+    if (ok) {
+      for (int i = 0; i < NUM_CLASSES; i++) myClassLabels[i] = names[i];
+      Serial.printf("Class labels from config.json: %s\n", myClassLabels[0].c_str());
+    } else Serial.println("config.json class names not usable as folder names - keeping compiled labels");
+  } else if (n < 0) {
+    Serial.println("config.json has no \"classes\" list - keeping compiled labels");
+  } else {
+    Serial.printf("config.json lists %d classes but this sketch has %d - keeping compiled labels\n", n, NUM_CLASSES);
+  }
+
+  int v;
+  if (myCfgInt(txt, "input_size", v) && v != INPUT_SIZE)
+    Serial.printf("WARNING: config.json input_size=%d but sketch INPUT_SIZE=%d\n", v, INPUT_SIZE);
+  if (myCfgInt(txt, "conv1_filters", v) && v != CONV1_FILTERS)
+    Serial.printf("WARNING: config.json conv1_filters=%d but sketch CONV1_FILTERS=%d\n", v, CONV1_FILTERS);
+  if (myCfgInt(txt, "conv2_filters", v) && v != CONV2_FILTERS)
+    Serial.printf("WARNING: config.json conv2_filters=%d but sketch CONV2_FILTERS=%d\n", v, CONV2_FILTERS);
+  if (myCfgInt(txt, "num_prototypes", v) && v != NUM_PROTOTYPES)
+    Serial.printf("WARNING: config.json num_prototypes=%d but sketch NUM_PROTOTYPES=%d\n", v, NUM_PROTOTYPES);
+}
+// ==CFG PARSE END==
+
+// ======================================================
+// v002: WEB SERIAL DEBUG FRAMES (only while index-v002.html is connected)
+// The page sends 'D' on connect and every 5 s, 'd' on disconnect.
+// 15 s without a 'D' turns the frames off by themselves.
+// One frame = one ASCII line:
+//   @F <kind> <n> <pred> <probs|-> <logits|-> <layout> <input-summary|-> <mapSide> <map|-> <jpeg>
+//   kind: I = inference (every 10th), C = sample just saved, P = slow live preview while collecting
+//   pred: 0 = normal, 1 = anomaly (smoothed score vs ANOMALY_THRESHOLD)   ('-' for C and P)
+//   probs: "raw,smoothed" normality scores (0..1, 4 decimals)
+//   logits: "denseLogit,gap0,gap1,..." (the dense logit then the GAP vector, 4 decimals)
+//   layout: INPUTxCONV1xCONV2   input-summary: centre pixel r,g,b of the model input (0..1)
+//   map: last conv layer, max over filters, scaled 0..255, mapSide x mapSide (base64)
+//   jpeg: the raw camera JPEG (base64)
+// Typical size: the JPEG is about 4-8 KB so a frame is about 6-11 KB of text (not measured).
+// 'P' is sent about once per second; 'I' about every 10th inference. Native USB is fast;
+// a 115200 baud UART bridge is about 100 times slower and cannot keep up with this.
+// ======================================================
+// ==DEBUG FRAMES START==
+bool myDebugOn = false;
+unsigned long myDebugLastD = 0;
+
+// Returns true if c was the heartbeat character (consumed). Call it wherever Serial is read.
+bool myDebugHandleChar(char c) {
+  if (c == 'D') {
+    myDebugLastD = millis();
+    if (!myDebugOn) { myDebugOn = true; Serial.println("Debug frames ON"); }
+    return true;
+  }
+  if (c == 'd') {
+    if (myDebugOn) { myDebugOn = false; Serial.println("Debug frames OFF"); }
+    return true;
+  }
+  return false;
+}
+
+// True only when frames are on, the page is still sending heartbeats, and Serial is connected.
+bool myDebugActive() {
+  if (myDebugOn && millis() - myDebugLastD > 15000) { myDebugOn = false; Serial.println("Debug frames OFF"); }
+  return myDebugOn && Serial;
+}
+
+// base64 in 384-byte chunks (multiple of 3) into a 520-byte buffer (512 chars + NUL), written at once
+static void myB64Out(const uint8_t* d, size_t n) {
+  char out[520];
+  for (size_t i = 0; i < n; i += 384) {
+    size_t k = (n - i < 384) ? (n - i) : 384, ol = 0;
+    if (mbedtls_base64_encode((unsigned char*)out, sizeof(out), &ol, d + i, k) != 0) return;
+    Serial.write((const uint8_t*)out, ol);
+  }
+}
+
+static void mySendFrame(char kind, unsigned long n, const String& pred, const String& probs, const String& logits,
+                        const String& inSum, int mapSide, const uint8_t* map, const camera_fb_t* fb) {
+  Serial.print("@F "); Serial.print(kind); Serial.print(' '); Serial.print(n); Serial.print(' ');
+  Serial.print(pred); Serial.print(' '); Serial.print(probs); Serial.print(' '); Serial.print(logits); Serial.print(' ');
+  Serial.printf("%dx%dx%d ", INPUT_SIZE, CONV1_FILTERS, CONV2_FILTERS);
+  Serial.print(inSum); Serial.print(' ');
+  Serial.print(mapSide); Serial.print(' ');
+  if (map && mapSide > 0) myB64Out(map, (size_t)mapSide * mapSide); else Serial.print('-');
+  Serial.print(' ');
+  myB64Out(fb->buf, fb->len);
+  Serial.print('\n');
+}
+
+// kind 'C' or 'P': just the camera image (the page rebuilds the model input from it)
+void mySendPlainFrame(char kind, unsigned long n, const camera_fb_t* fb) {
+  if (!fb || !myDebugActive()) return;
+  mySendFrame(kind, n, "-", "-", "-", "-", 0, nullptr, fb);
+}
+
+// kind 'I': call right after myForwardPass + myComputeGAP + score (uses the globals they filled)
+void mySendInferFrame(unsigned long n, bool anom, float raw, float smooth, float logit, const camera_fb_t* fb) {
+  if (!fb || n % 10 != 0 || !myDebugActive()) return;
+  String probs = String(raw, 4) + "," + String(smooth, 4);
+  String logits = String(logit, 4);
+  for (int i = 0; i < GAP_SIZE; i++) logits += "," + String(myGapVector[i], 4);
+  int c = (INPUT_SIZE / 2 * INPUT_SIZE + INPUT_SIZE / 2) * 3;
+  String inSum = String(myInputBuffer[c], 4) + "," + String(myInputBuffer[c+1], 4) + "," + String(myInputBuffer[c+2], 4);
+  static uint8_t myMap[CONV2_OUTPUT_SIZE * CONV2_OUTPUT_SIZE];
+  const int cells = CONV2_OUTPUT_SIZE * CONV2_OUTPUT_SIZE;
+  float mx = 1e-6f;
+  for (int i = 0; i < cells * CONV2_FILTERS; i++) if (myConv2_output[i] > mx) mx = myConv2_output[i];
+  for (int i = 0; i < cells; i++) {
+    float cm = 0;
+    for (int f = 0; f < CONV2_FILTERS; f++) if (myConv2_output[f * cells + i] > cm) cm = myConv2_output[f * cells + i];
+    myMap[i] = (uint8_t)constrain((int)(cm / mx * 255.0f), 0, 255);
+  }
+  mySendFrame('I', n, anom ? "1" : "0", probs, logits, inSum, CONV2_OUTPUT_SIZE, myMap, fb);
+}
+// ==DEBUG FRAMES END==
+
+// ======================================================
 // FORWARD DECLARATIONS
 // ======================================================
 void myActionCollect(int classIdx);
@@ -518,9 +756,10 @@ void setup() {
   while (!Serial && millis() < 3000);
   delay(1000);
 
-  Serial.println("\n=== XIAO ESP32-S3 Anomaly Detection Starting ===");
+  Serial.println("\n=== XIAO ESP32-S3 Anomaly Detection Starting (v002) ===");
   Serial.printf("Free heap:  %d bytes\n", ESP.getFreeHeap());
   Serial.printf("Free PSRAM: %d bytes\n", ESP.getFreePsram());
+  myPrintLayout();   // v002
 
   myRgbBuffer = (uint8_t*)ps_malloc(240*240*3);
   if (!myRgbBuffer) Serial.println("Failed to allocate RGB buffer!");
@@ -544,9 +783,10 @@ void setup() {
     delay(2000);
   } else {
     Serial.println("SD card mounted successfully");
+    myLoadConfig();   // v002: class names + layout warnings from /header/config.json
   }
 
-  camera_config_t config;
+  camera_config_t config = {};   // v002: was uninitialised (garbage in fb_location, grab_mode, ...)
   config.ledc_channel = LEDC_CHANNEL_0; config.ledc_timer = LEDC_TIMER_0;
   config.pin_d0 = Y2_GPIO_NUM; config.pin_d1 = Y3_GPIO_NUM;
   config.pin_d2 = Y4_GPIO_NUM; config.pin_d3 = Y5_GPIO_NUM;
@@ -559,10 +799,24 @@ void setup() {
   config.xclk_freq_hz = 20000000; config.pixel_format = PIXFORMAT_JPEG;
   config.frame_size = FRAMESIZE_240X240; config.jpeg_quality = 12;
   config.fb_count = 1;
-  esp_camera_init(&config);
-  Serial.println("Camera initialized");
-  sensor_t* s = esp_camera_sensor_get();
-  if (s != NULL) { s->set_hmirror(s, 1); }
+  esp_err_t myCamErr = esp_camera_init(&config);   // v002: result is checked now
+  if (myCamErr != ESP_OK) {
+    Serial.printf("Camera init FAILED: 0x%x\n", myCamErr);
+  } else {
+    Serial.println("Camera initialized");
+    sensor_t* s = esp_camera_sensor_get();
+    if (s != NULL) {   // v002: orientation + brightness parity with the web page
+      s->set_hmirror(s, CAM_HMIRROR);
+      s->set_vflip(s, CAM_VFLIP);
+      s->set_brightness(s, CAM_BRIGHTNESS);
+      s->set_ae_level(s, CAM_AE_LEVEL);
+    }
+    for (int i = 0; i < CAM_WARMUP_FRAMES; i++) {   // v002: discard the first frames
+      camera_fb_t* wfb = esp_camera_fb_get();
+      if (wfb) esp_camera_fb_return(wfb);
+      delay(30);
+    }
+  }
 
   esp_log_level_set("*",          ESP_LOG_WARN);
   esp_log_level_set("esp_camera", ESP_LOG_ERROR);
@@ -665,6 +919,7 @@ void myActionCollect(int classIdx) {
   }
 
   unsigned long lastCameraDrain = 0, lastOLED = 0;
+  unsigned long myLastPreview = 0, myPreviewN = 0;   // v002: slow 'P' debug frames
   bool oledNeedsUpdate = false, shouldCapture = false;
 
   while (true) {
@@ -679,6 +934,10 @@ void myActionCollect(int classIdx) {
               oledNeedsUpdate = true; lastOLED = now;
             }
           }
+          if (now - myLastPreview > 1000) {            // v002
+            myLastPreview = now;
+            mySendPlainFrame('P', ++myPreviewN, fb);
+          }
           esp_camera_fb_return(fb);
         }
       }
@@ -687,7 +946,8 @@ void myActionCollect(int classIdx) {
 
     if (Serial.available()) {
       char c = Serial.read();
-      if (c=='l'||c=='L') { myResetMenuState(); return; }
+      if (myDebugHandleChar(c)) { /* v002: heartbeat */ }
+      else if (c=='l'||c=='L') { myResetMenuState(); return; }
       else if (c=='t'||c=='T') shouldCapture = true;
     }
 
@@ -705,6 +965,7 @@ void myActionCollect(int classIdx) {
           file.write(fb->buf, fb->len); file.close();
           counts[classIdx]++;
           Serial.printf("Saved: %s (Total: %d)\n", fileName.c_str(), counts[classIdx]);
+          mySendPlainFrame('C', counts[classIdx], fb);   // v002: the sample that was just saved
           myDisplayImageOnOLED(fb, counts[classIdx]);
           delay(300); lastOLED = millis();
         }
@@ -765,7 +1026,7 @@ void myForwardPass(float* input, float* logits) {
         for(int c=0;c<CONV1_FILTERS;c++) {
           int ib=c*POOL1_OUTPUT_SIZE*POOL1_OUTPUT_SIZE;
           for(int ky=0;ky<3;ky++) for(int kx=0;kx<3;kx++)
-            sum+=myPool1_output[ib+(y+ky)*POOL1_OUTPUT_SIZE+(x+kx)]*myConv2_w[f*36+c*9+ky*3+kx];
+            sum+=myPool1_output[ib+(y+ky)*POOL1_OUTPUT_SIZE+(x+kx)]*myConv2_w[f*CONV2_FAN_IN+c*9+ky*3+kx];   // v002: was f*36
         }
         myConv2_output[ob+y*CONV2_OUTPUT_SIZE+x]=leaky_relu(clip_value(sum+myConv2_b[f]));
       }
@@ -848,7 +1109,7 @@ void myBackwardConv2() {
           int ib=c*POOL1_OUTPUT_SIZE*POOL1_OUTPUT_SIZE;
           for(int ky=0;ky<3;ky++) for(int kx=0;kx<3;kx++) {
             int pi=ib+(y+ky)*POOL1_OUTPUT_SIZE+(x+kx);
-            int wi=f*36+c*9+ky*3+kx;
+            int wi=f*CONV2_FAN_IN+c*9+ky*3+kx;   // v002: was f*36
             myConv2_w_grad[wi]+=grad*myPool1_output[pi];
             myPool1_grad[pi]  +=grad*myConv2_w[wi];
           }
@@ -1215,7 +1476,8 @@ void myActionTrain() {
     while (true) {
       if (Serial.available()) {
         char c=Serial.read();
-        if(c=='x'||c=='X'||c=='l'||c=='L') { myResetMenuState(); return; }
+        if (myDebugHandleChar(c)) { /* v002: heartbeat */ }
+        else if(c=='x'||c=='X'||c=='l'||c=='L') { myResetMenuState(); return; }
         else if(c=='t'||c=='T') break;
       }
       int touchAction=myCheckTouchInput();
@@ -1249,6 +1511,7 @@ void myActionInfer() {
   Serial.println("  Serial: T or L = exit");
   myResetTouchState();
   mySmoothedScore = 0.5f;
+  unsigned long myInferCount = 0;   // v002: counts inferences for the 'I' debug frames
 
   // Pre-compute resize lookup tables
   static int sy_lookup[INPUT_SIZE], sx_lookup[INPUT_SIZE];
@@ -1269,7 +1532,8 @@ void myActionInfer() {
 
     if (Serial.available()) {
       char c=Serial.read();
-      if(c=='t'||c=='T'||c=='l'||c=='L') { myResetMenuState(); return; }
+      if (myDebugHandleChar(c)) { /* v002: heartbeat */ }
+      else if(c=='t'||c=='T'||c=='l'||c=='L') { myResetMenuState(); return; }
     }
 
     camera_fb_t* fb=esp_camera_fb_get();
@@ -1303,6 +1567,9 @@ void myActionInfer() {
       mySmoothedScore = TEMPORAL_ALPHA*mySmoothedScore + (1.0f-TEMPORAL_ALPHA)*rawScore;
       pct = (int)(mySmoothedScore * 100.0f);
       isAnomaly = (mySmoothedScore < ANOMALY_THRESHOLD);
+
+      myInferCount++;   // v002: debug frame for the web page (only when it is connected)
+      mySendInferFrame(myInferCount, isAnomaly, rawScore, mySmoothedScore, logits[0], fb);
 
       // OLED: every 10th frame draw image + anomaly overlay
       if (frameIndex == 9) {
@@ -1399,10 +1666,13 @@ void myExecuteMenuItem(int idx) {
 
 void myHandleMenuNavigation() {
   unsigned long myCurrentMillis=millis();
+  myDebugActive();   // v002: lets the debug frames time out even while idle in the menu
 
   if (!myIsSelected && Serial.available()) {
     char c=Serial.read();
-    if(c>='1'&&c<='9') {
+    if (myDebugHandleChar(c)) {
+      /* v002: heartbeat from the web page */
+    } else if(c>='1'&&c<='9') {
       int newIndex=c-'0';
       if(newIndex<=myTotalItems) {
         myMenuIndex=newIndex; myIsSelected=true;
